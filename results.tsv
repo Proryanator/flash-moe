@@ -11,3 +11,14 @@ HEAD	Qwen3.5-35B-A3B-4bit	5.4	3.0	36.95	841	14.5	keep	35B baseline (fits DRAM) -
 HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	0.47	6305	20.6	keep	397B MOONSHOT - 209GB model on 48GB laptop, 23% cache hit at 5 tokens
 HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	0.96	6008	21.4	keep	397B 20-token run - 0.96 tok/s, 44% cache hit, still climbing
 HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	1.03	11341	21.4	keep	397B 50-token steady state - 1.03 tok/s, 50% cache hit, plateau reached
+HEAD	Qwen3.5-122B-A10B-4bit	122.0	10.0	0.23	6114	10.8	discard	speculative decode (35B draft K=4) - 33% accept rate, 4.5x SLOWER than baseline
+HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	0.65	9611	20.8	discard	preloaded hot experts (profiled) - wrong routing, wasted cache space
+HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	1.18	4367	28.1	discard	LFU cache - same hit rate as LRU, scan overhead made it slower
+HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	1.32	4335	28.2	keep	28GB LRU cache - 61% hit rate, 28% speedup over 20GB baseline
+HEAD	Qwen3.5-122B-A10B-4bit	122.0	10.0	3.53	6318	25.8	keep	expanded 28GB cache (5274 entries) - 82% hit rate at 200tok, still climbing
+HEAD	Qwen3.5-122B-A10B-4bit	122.0	10.0	3.99	11308	25.8	keep	500tok steady state - 86% hit rate plateau, ~4.7 tok/s instantaneous
+573e190	Qwen3.5-397B-A17B-4bit	397.0	17.0	1.47	12129	25.3	keep	PROFILING: I/O=434ms(64%), mx.eval=224ms(33%), SSD=3.5GB/s, GPU=3.7ms actual
+ee5858b	Qwen3.5-397B-A17B-4bit	397.0	17.0	0.91	19688	25.3	discard	pread+F_NOCACHE - 1.8GB/s, SLOWER than mmap (bypassed page cache)
+ee5858b	Qwen3.5-397B-A17B-4bit	397.0	17.0	1.45	11724	25.5	discard	pread+pagecache+8threads - ~4.1GB/s, GIL limits parallelism, matches mmap
+ee5858b	Qwen3.5-397B-A17B-4bit	397.0	17.0	0.30	12429	28.2	discard	33GB cache - memory pressure abort at 9% free, can't fit working set
+HEAD	fast_expert_io.c	397.0	17.0	0.00	0	0	keep	C extension benchmark: 18.8 GB/s cold (8 pthreads, preadv, sorted reads)
