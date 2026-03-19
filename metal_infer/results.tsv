@@ -1,5 +1,5 @@
 HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	3.30	2464	5.5	keep	C/METAL E2E: "the best way to make a cup of tea?" 300ms/tok. GPU attn scores REVERTED (too slow for short ctx)
-HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	5.29	0	5.5	keep	C/METAL peak: 189ms/tok, GPU norm+residual+fused dispatch. Quality output.
+HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	5.29	0	5.5	discard	C/METAL peak — DISCARDED: warm Metal LRU cache: 189ms/tok, GPU norm+residual+fused dispatch. Quality output.
 HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	2.79	0	5.5	keep	C/METAL: BLAS delta-net (0.28ms vs 0.78ms cpu_attn), GCD dispatch, gated timing. 352ms/tok avg.
 HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	0.56	0	5.5	discard	mmap expert files: CATASTROPHIC 5x regression. Per-page faults 100x slower than pread for uncached 7MB experts.
 HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	2.10	0	5.5	discard	Malloc zero-copy cache 2581 entries (18GB): 52% hit but GPU memory pressure + page cache loss = slower
@@ -10,7 +10,7 @@ HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	2.75	0	5.5	keep	GPU combine+norm in CMD3:
 HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	3.50	0	5.5	keep	GPU RoPE + fused CMD1+attention for full-attn layers. 4.76ms/layer (was 5.53). Quality verified.
 HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	2.83	0	5.5	keep	STABLE: GPU combine+norm + BLAS delta-net + fused full-attn CMD + 500 LRU cache. Cold cache 2.75-2.85 tok/s.
 HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	4.20	0	5.5	keep	4-bit warm cache: 4.20 tok/s sustained! Quality: Imagine you are in a massive library...
-HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	4.80	0	5.5	keep	4-bit WARM: 4.80 avg, 5.31 peak. Matches previous 4.74/5.29. Code at parity + 2-bit infra ready.
+HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	4.80	0	5.5	discard	4-bit WARM — DISCARDED: warm Metal LRU cache: 4.80 avg, 5.31 peak. Matches previous 4.74/5.29. Code at parity + 2-bit infra ready.
 HEAD	Qwen3.5-397B-A17B-2bit	397.0	17.0	5.55	0	5.5	keep	2-BIT EXPERTS: 5.55 tok/s sustained 80 tokens! Quality: 'Classic Coin Analogy...light switch...Heads or'. EXCELLENT.
 HEAD	Qwen3.5-397B-A17B-2bit	397.0	17.0	5.61	0	5.5	keep	2-BIT 200tok: 5.61 tok/s sustained. Quality: math(255=15*17 CORRECT), code(sorted+key=len), science(plant analogy)
 HEAD	Qwen3.5-397B-A17B-2bit	397.0	17.0	5.68	0	5.5	keep	F_NOCACHE + 2-bit: 5.68 avg, 5.91 peak. Bypass page cache avoids thrashing 120GB data.

@@ -30,3 +30,8 @@ __pycache__/
 *.npz
 logs/
 *.log
+
+# Test binaries and experiment data
+metal_infer/test_lzfse
+metal_infer/repack_experts_lz4
+metal_infer/routing_data.bin

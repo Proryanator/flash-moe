@@ -18,7 +18,7 @@
 CC = clang
 CFLAGS = -O2 -Wall -Wextra -fobjc-arc -DACCELERATE_NEW_LAPACK
 FRAMEWORKS = -framework Metal -framework Foundation -framework Accelerate
-LDFLAGS = -lpthread
+LDFLAGS = -lpthread -lcompression
 
 TARGET = metal_infer
 MAIN_SRC = main.m

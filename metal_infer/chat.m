@@ -632,40 +632,88 @@ int main(int argc, char **argv) {
             char *tc_end = strstr(tc_start, "</tool_call>");
             if (!tc_start || !tc_end) break;
 
-            // Extract JSON between tags
+            // Extract content between tags
             tc_start += 11;  // skip <tool_call>
-            char tc_json[4096] = {0};
+            char tc_body[4096] = {0};
             int tc_len = (int)(tc_end - tc_start);
             if (tc_len > 4095) tc_len = 4095;
-            memcpy(tc_json, tc_start, tc_len);
+            memcpy(tc_body, tc_start, tc_len);
 
-            // Parse command from JSON: find "command":"..."
-            char *cmd_key = strstr(tc_json, "\"command\"");
-            if (!cmd_key) break;
-            cmd_key = strchr(cmd_key + 9, '"');
-            if (!cmd_key) break;
-            cmd_key++;  // skip opening quote
-
+            // Parse command — handle multiple formats the model might produce:
+            // 1. JSON: {"name":"bash","arguments":{"command":"ls -la"}}
+            // 2. XML-ish: <function=bash><arg_key>command</arg_key><arg_value>ls -la</arg_value>
+            // 3. Simple: just a command string
             char command[4096] = {0};
             int ci = 0;
-            for (int i = 0; cmd_key[i] && cmd_key[i] != '"' && ci < 4095; i++) {
-                if (cmd_key[i] == '\\' && cmd_key[i+1]) {
-                    i++;
-                    switch (cmd_key[i]) {
-                        case 'n': command[ci++] = '\n'; break;
-                        case '"': command[ci++] = '"'; break;
-                        case '\\': command[ci++] = '\\'; break;
-                        default: command[ci++] = cmd_key[i]; break;
+
+            char *cmd_key = strstr(tc_body, "\"command\"");
+            if (cmd_key) {
+                // JSON format: find value after "command":"
+                cmd_key = strchr(cmd_key + 9, '"');
+                if (cmd_key) {
+                    cmd_key++;
+                    for (int i = 0; cmd_key[i] && cmd_key[i] != '"' && ci < 4095; i++) {
+                        if (cmd_key[i] == '\\' && cmd_key[i+1]) {
+                            i++;
+                            switch (cmd_key[i]) {
+                                case 'n': command[ci++] = '\n'; break;
+                                case '"': command[ci++] = '"'; break;
+                                case '\\': command[ci++] = '\\'; break;
+                                default: command[ci++] = cmd_key[i]; break;
+                            }
+                        } else {
+                            command[ci++] = cmd_key[i];
+                        }
                     }
-                } else {
-                    command[ci++] = cmd_key[i];
+                }
+            }
+            // Fallback: look for <arg_value>...</arg_value> (model's XML format)
+            if (ci == 0) {
+                char *av = strstr(tc_body, "<arg_value>");
+                if (av) {
+                    av += 11;
+                    char *av_end = strstr(av, "</arg_value>");
+                    if (!av_end) av_end = strstr(av, "<");
+                    if (av_end) {
+                        int avlen = (int)(av_end - av);
+                        if (avlen > 4095) avlen = 4095;
+                        memcpy(command, av, avlen);
+                        ci = avlen;
+                        // Trim whitespace
+                        while (ci > 0 && (command[ci-1] == '\n' || command[ci-1] == ' ')) ci--;
+                        command[ci] = 0;
+                    }
+                }
+            }
+            // Fallback: look for function=bash followed by any command-like text
+            if (ci == 0) {
+                char *fn = strstr(tc_body, "bash");
+                if (fn) {
+                    // Take everything after "bash" that looks like a command
+                    fn += 4;
+                    while (*fn && (*fn == '>' || *fn == '\n' || *fn == ' ' || *fn == '"')) fn++;
+                    while (*fn && *fn != '<' && *fn != '"' && ci < 4095) {
+                        command[ci++] = *fn++;
+                    }
+                    while (ci > 0 && (command[ci-1] == '\n' || command[ci-1] == ' ')) ci--;
+                    command[ci] = 0;
                 }
             }
 
             if (ci == 0) break;
 
-            // Show the command
+            // Show the command and ask for confirmation
             printf("\033[33m$ %s\033[0m\n", command);
+            printf("\033[2m[execute? y/n] \033[0m");
+            fflush(stdout);
+            int ch = getchar();
+            while (getchar() != '\n');  // consume rest of line
+            if (ch != 'y' && ch != 'Y') {
+                printf("\033[2m[skipped]\033[0m\n");
+                free(response);
+                response = NULL;
+                break;
+            }
 
             // Execute
             FILE *proc = popen(command, "r");

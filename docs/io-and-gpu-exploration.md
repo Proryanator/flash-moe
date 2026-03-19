@@ -200,7 +200,7 @@ This is a classic systems engineering lesson: optimizing one component in isolat
 
 ### What the database world already knew
 
-Dan Woods (creator of Ratpack, extensive database performance tuning experience) brought the key insight: **treat the model weights like a database.** Databases have solved the problem of accessing datasets larger than memory for decades:
+Dan Woods brought the key insight: **treat the model weights like a database.** Databases have solved the problem of accessing datasets larger than memory for decades:
 
 - **Don't build your own buffer pool.** PostgreSQL learned this — `shared_buffers` should be 25% of RAM, not 100%. The OS buffer cache handles the long tail better.
 - **Respect the hardware cache hierarchy.** Don't bypass caches (F_NOCACHE) unless you have measured evidence of thrashing. The caches exist for a reason.

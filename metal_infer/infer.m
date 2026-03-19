@@ -63,6 +63,7 @@
 #include <netinet/in.h>
 #include <signal.h>
 #include <sys/wait.h>
+#include <compression.h>
 
 // ============================================================================
 // Model constants
@@ -161,6 +162,30 @@ typedef struct {
 static LayerTimingAccum g_timing = {0};
 static int g_timing_enabled = 0;
 
+// Temporal prediction pipeline counters (declared early for timing_print access)
+static int g_pred_enabled = 0;
+static int g_pred_generating = 0;   // only set to 1 after prefill (predictions only help during generation)
+static uint64_t g_pred_hits = 0;
+static uint64_t g_pred_misses = 0;
+static uint64_t g_pred_layers = 0;
+
+// Routing data collection for training an expert predictor
+// Binary format per sample: int32 layer_idx, int32 K, float32[4096] hidden, int32[K] expert_indices
+static FILE *g_routing_log = NULL;
+static int g_routing_log_samples = 0;
+
+// LZ4 compressed expert support
+// File format: [LZ4IndexEntry × 512] + [compressed blobs]
+typedef struct {
+    uint64_t offset;
+    uint32_t comp_size;
+    uint32_t raw_size;
+} LZ4IndexEntry;
+
+static LZ4IndexEntry *g_lz4_index[NUM_LAYERS];  // per-layer index (NULL if not using LZ4)
+static void *g_lz4_comp_bufs[8];                 // pre-allocated compressed read buffers (MAX_K=8)
+static int g_use_lz4 = 0;                        // auto-detected from packed_experts_lz4/
+
 // ============================================================================
 // Expert frequency tracking (diagnostic: --freq flag)
 // ============================================================================
@@ -174,6 +199,8 @@ static int g_think_budget = 2048; // max thinking tokens before force-emitting <
 // Tiered I/O: cold fds (F_NOCACHE) for first reads, warm fds (page cached) for repeats
 static int *g_layer_fds_cold = NULL;    // [NUM_LAYERS] cold fds (set in main)
 static uint8_t g_expert_seen[NUM_LAYERS][NUM_EXPERTS / 8];  // bitset: seen before?
+
+// Async pread state defined after InferPreadTask (see below)
 
 static inline int expert_is_seen(int layer, int expert) {
     return (g_expert_seen[layer][expert >> 3] >> (expert & 7)) & 1;
@@ -331,6 +358,12 @@ static void timing_print(void) {
     fprintf(stderr, "  sync_waits:     %d (2 per layer: CMD1+CMD2, CMD3 deferred)\n", n * 2);
     fprintf(stderr, "  gpu_encoders:   ~%d per layer (CMD1:3-4, CMD2:8-12, CMD3:~10)\n",
             22);  // approximate
+    if (g_pred_enabled && g_pred_layers > 0) {
+        uint64_t total = g_pred_hits + g_pred_misses;
+        double hit_rate = total > 0 ? (double)g_pred_hits / total * 100.0 : 0;
+        fprintf(stderr, "  [predict] hits=%llu misses=%llu rate=%.1f%% layers=%llu\n",
+                g_pred_hits, g_pred_misses, hit_rate, g_pred_layers);
+    }
 }
 
 // ============================================================================
@@ -869,6 +902,7 @@ typedef struct {
     id<MTLCommandQueue>         queue;
     id<MTLLibrary>              library;
     id<MTLComputePipelineState> matvec_v3;
+    id<MTLComputePipelineState> matvec_v5;  // LUT dequant variant
     id<MTLComputePipelineState> matvec_fast;  // for in_dim > 4096
     id<MTLComputePipelineState> matvec_2bit;  // 2-bit expert dequant kernel
     id<MTLComputePipelineState> rms_norm_sum;
@@ -1008,6 +1042,7 @@ static MetalCtx *metal_setup(void) {
     };
 
     ctx->matvec_v3     = makePipe(@"dequant_matvec_4bit_v3");
+    ctx->matvec_v5     = makePipe(@"dequant_matvec_4bit_v5");  // LUT variant (no uint→float conversions)
     ctx->matvec_fast   = makePipe(@"dequant_matvec_4bit_fast");
     ctx->matvec_2bit   = makePipe(@"dequant_matvec_2bit");
     ctx->rms_norm_sum  = makePipe(@"rms_norm_sum_sq");
@@ -2911,6 +2946,9 @@ typedef struct {
     size_t size;
     ssize_t result;
     const void *mmap_base;  // if non-NULL, memcpy from mmap instead of pread
+    // LZ4 compression fields (set by caller when reading compressed experts)
+    void *lz4_comp_buf;     // if non-NULL: pread into this, then LZ4 decompress into dst
+    uint32_t lz4_comp_size; // compressed size to read from disk
 } InferPreadTask;
 
 typedef struct {
@@ -2965,7 +3003,20 @@ static void *io_pool_worker(void *arg) {
         // Process assigned tasks (stride by thread count)
         for (int i = tid; i < num_tasks; i += NUM_IO_THREADS) {
             InferPreadTask *t = &tasks[i];
-            t->result = pread(t->fd, t->dst, t->size, t->offset);
+            if (t->lz4_comp_buf && t->lz4_comp_size > 0) {
+                // LZ4 path: read compressed from SSD, decompress into dst
+                ssize_t nr = pread(t->fd, t->lz4_comp_buf, t->lz4_comp_size, t->offset);
+                if (nr == (ssize_t)t->lz4_comp_size) {
+                    size_t dec = compression_decode_buffer(
+                        t->dst, t->size, t->lz4_comp_buf, t->lz4_comp_size,
+                        NULL, COMPRESSION_LZ4);
+                    t->result = (ssize_t)dec;
+                } else {
+                    t->result = -1;
+                }
+            } else {
+                t->result = pread(t->fd, t->dst, t->size, t->offset);
+            }
         }
 
         pthread_mutex_lock(&g_io_pool.mutex);
@@ -3004,6 +3055,54 @@ static void io_pool_dispatch(InferPreadTask *tasks, int num_tasks) {
         pthread_cond_wait(&g_io_pool.work_done, &g_io_pool.mutex);
     }
     pthread_mutex_unlock(&g_io_pool.mutex);
+}
+
+// ---- Async expert pread pipeline ----
+// Starts pread on background GCD threads immediately after routing.
+// The pread overlaps with shared expert prep + next layer's CMD1+attn+CMD2.
+// Wait for completion right before CMD3 needs the expert data.
+typedef struct {
+    InferPreadTask tasks[MAX_K];
+    int num_tasks;
+    int valid[MAX_K];
+    dispatch_group_t group;
+    int active;
+} AsyncPreadState;
+static AsyncPreadState g_async_pread = {0};
+
+static void async_pread_start(int packed_fd, int *expert_indices, int K,
+                               id<MTLBuffer> __strong *dst_bufs, const void *mmap_base) {
+    size_t esz = active_expert_size();
+    g_async_pread.num_tasks = K;
+    g_async_pread.active = 1;
+    if (!g_async_pread.group) g_async_pread.group = dispatch_group_create();
+
+    for (int k = 0; k < K; k++) {
+        g_async_pread.tasks[k].fd = packed_fd;
+        g_async_pread.tasks[k].dst = [dst_bufs[k] contents];
+        g_async_pread.tasks[k].offset = (off_t)expert_indices[k] * esz;
+        g_async_pread.tasks[k].size = esz;
+        g_async_pread.tasks[k].result = 0;
+    }
+
+    // Fire off parallel preads on GCD — returns immediately
+    static dispatch_queue_t io_q = NULL;
+    if (!io_q) io_q = dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0);
+    for (int k = 0; k < K; k++) {
+        InferPreadTask *t = &g_async_pread.tasks[k];
+        dispatch_group_async(g_async_pread.group, io_q, ^{
+            t->result = pread(t->fd, t->dst, t->size, t->offset);
+        });
+    }
+}
+
+static void async_pread_wait(void) {
+    if (!g_async_pread.active) return;
+    dispatch_group_wait(g_async_pread.group, DISPATCH_TIME_FOREVER);
+    for (int k = 0; k < g_async_pread.num_tasks; k++) {
+        g_async_pread.valid[k] = (g_async_pread.tasks[k].result == (ssize_t)active_expert_size());
+    }
+    g_async_pread.active = 0;
 }
 
 static void io_pool_shutdown(void) {
@@ -3130,6 +3229,19 @@ static ExpertLRUCache *g_expert_cache = NULL;
 static uint64_t g_spec_route_attempts = 0;   // total speculative routing attempts
 static uint64_t g_spec_route_hits = 0;        // correctly predicted experts (found in cache at real routing time)
 static uint64_t g_spec_route_preloads = 0;    // async preloads initiated (cache misses at speculation time)
+
+// ---- Temporal prediction pipeline ----
+// Stores previous token's expert routing per layer. On the next token,
+// predicted experts are preloaded into buf_multi_expert_data_B during CMD1_wait
+// idle time. After routing, hits use buf_B, misses sync-pread into buf_A.
+// Different from previous failed speculative attempts:
+//   - Loads into scratch buffers (no cache pollution)
+//   - Uses CMD1_wait idle time (no additional CPU cost)
+//   - Only sync-preads misses (not all K experts)
+static int g_pred_experts[60][MAX_K];              // previous token's expert indices per layer
+static int g_pred_count[60];                       // how many experts stored per layer
+static int g_pred_valid = 0;                       // 1 after first token completes (predictions available)
+// g_pred_enabled, g_pred_hits, g_pred_misses, g_pred_layers declared near timing (line ~163)
 
 static ExpertLRUCache *expert_cache_new(id<MTLDevice> device, int max_entries) {
     ExpertLRUCache *cache = calloc(1, sizeof(ExpertLRUCache));
@@ -3896,6 +4008,7 @@ static void fused_layer_forward(
 ) {
     double t_layer_start = 0, t0 = 0, t1 = 0;
     if (g_timing_enabled) { t_layer_start = now_ms(); }
+    int pred_started = 0;  // set to 1 if we started prediction preads during CMD1_wait
 
     init_layer_scratch();
     if (!layer_cache_built) build_layer_cache(wf);
@@ -4088,6 +4201,18 @@ static void fused_layer_forward(
         // Now CMD3(N-1) is done. Read back hidden state from GPU.
         if (g_timing_enabled) { t0 = now_ms(); }
         finalize_deferred_experts();  // reads buf_moe_hidden -> hidden
+
+        // Start predicted expert preads AFTER CMD1_wait.
+        // CMD3(N-1) is guaranteed done (serial queue), so buf_B is safe to overwrite.
+        // Predictions overlap with CPU attn + CMD2 + routing (~0.6ms head start).
+        // Predicted experts that hit page cache (same as previous token) complete in ~0.1ms.
+        if (g_pred_enabled && g_pred_generating && g_pred_valid && packed_fd >= 0 &&
+            g_metal->buf_multi_expert_data_B[0] && g_pred_count[layer_idx] > 0) {
+            async_pread_start(packed_fd, g_pred_experts[layer_idx],
+                              g_pred_count[layer_idx],
+                              g_metal->buf_multi_expert_data_B, mmap_base);
+            pred_started = 1;
+        }
         // Set up residual for CMD2 (residual = hidden before this layer's attention)
         cpu_vec_copy(residual, hidden, HIDDEN_DIM);
         if (g_timing_enabled) { t1 = now_ms(); g_timing.deferred_cpu += t1 - t0; }
@@ -4931,6 +5056,17 @@ static void fused_layer_forward(
 
     if (g_timing_enabled) { t1 = now_ms(); g_timing.routing_cpu += t1 - t0; }
 
+    // Log routing data for predictor training
+    if (g_routing_log) {
+        int32_t li = layer_idx;
+        int32_t ki = (K > MAX_K) ? MAX_K : K;
+        fwrite(&li, sizeof(int32_t), 1, g_routing_log);
+        fwrite(&ki, sizeof(int32_t), 1, g_routing_log);
+        fwrite(hidden, sizeof(float), HIDDEN_DIM, g_routing_log);
+        fwrite(expert_indices, sizeof(int32_t), ki, g_routing_log);
+        g_routing_log_samples++;
+    }
+
     // ---- Parallel pread + GPU experts ----
     if (g_timing_enabled) { t0 = now_ms(); }
     float *moe_out = s_moe_out;
@@ -5057,19 +5193,118 @@ static void fused_layer_forward(
                     }
                 }
             }
+        } else if (pred_started) {
+            // ---- Prediction path: predicted experts already loading into buf_B ----
+            // Wait for predicted preads (they've had ~1.6ms: CMD1_wait + attn + CMD2 + routing)
+            async_pread_wait();
+            g_pred_layers++;
+
+            // Match predictions against actual routing
+            int miss_ei[MAX_K];       // actual expert indices for misses
+            int miss_k_slots[MAX_K];  // which k-slot each miss maps to
+            int miss_count = 0;
+            int hit_count = 0;
+
+            for (int k = 0; k < actual_K; k++) {
+                int found = 0;
+                for (int p = 0; p < g_pred_count[layer_idx]; p++) {
+                    if (expert_indices[k] == g_pred_experts[layer_idx][p] &&
+                        g_async_pread.valid[p]) {
+                        // Hit! This expert was pre-loaded into buf_B[p]
+                        expert_bufs[k] = g_metal->buf_multi_expert_data_B[p];
+                        valid[k] = 1;
+                        found = 1;
+                        hit_count++;
+                        break;
+                    }
+                }
+                if (!found) {
+                    miss_ei[miss_count] = expert_indices[k];
+                    miss_k_slots[miss_count] = k;
+                    expert_bufs[k] = g_metal->buf_multi_expert_data[k];
+                    miss_count++;
+                }
+            }
+            g_pred_hits += hit_count;
+            g_pred_misses += miss_count;
+
+            // Parallel sync-pread misses into buf_A
+            if (miss_count > 0) {
+                InferPreadTask tasks[MAX_K];
+                size_t esz = active_expert_size();
+                for (int m = 0; m < miss_count; m++) {
+                    int k = miss_k_slots[m];
+                    tasks[m].fd = packed_fd;
+                    tasks[m].dst = [g_metal->buf_multi_expert_data[k] contents];
+                    tasks[m].offset = (off_t)miss_ei[m] * esz;
+                    tasks[m].size = esz;
+                    tasks[m].result = 0;
+                }
+                io_pool_dispatch(tasks, miss_count);
+                for (int m = 0; m < miss_count; m++) {
+                    int k = miss_k_slots[m];
+                    valid[k] = (tasks[m].result == (ssize_t)active_expert_size());
+                }
+            }
+        } else if (g_use_lz4 && g_lz4_index[layer_idx]) {
+            // ---- LZ4 compressed path: read compressed + decompress via io_pool ----
+            size_t esz = active_expert_size();
+            InferPreadTask tasks[MAX_K];
+            for (int k = 0; k < actual_K; k++) {
+                LZ4IndexEntry *ie = &g_lz4_index[layer_idx][expert_indices[k]];
+                tasks[k].fd = packed_fd;
+                tasks[k].dst = [g_metal->buf_multi_expert_data[k] contents];
+                tasks[k].offset = ie->offset;
+                tasks[k].size = esz;
+                tasks[k].result = 0;
+                tasks[k].mmap_base = NULL;
+                tasks[k].lz4_comp_buf = g_lz4_comp_bufs[k];
+                tasks[k].lz4_comp_size = ie->comp_size;
+                expert_bufs[k] = g_metal->buf_multi_expert_data[k];
+            }
+            io_pool_dispatch(tasks, actual_K);
+            for (int k = 0; k < actual_K; k++) {
+                valid[k] = (tasks[k].result == (ssize_t)esz);
+            }
         } else {
-            // ---- No cache: original parallel pread into buf_multi_expert_data ----
-            parallel_pread_experts(packed_fd, expert_indices, actual_K, valid, mmap_base);
+            // ---- No cache, no prediction, no LZ4: ASYNC parallel pread ----
+            async_pread_start(packed_fd, expert_indices, actual_K,
+                              g_metal->buf_multi_expert_data, mmap_base);
             for (int k = 0; k < actual_K; k++) {
                 expert_bufs[k] = g_metal->buf_multi_expert_data[k];
             }
         }
 
-        // Step 2: copy input
+        // Shared expert prep (doesn't need expert data — can overlap with async pread)
+        memcpy([g_metal->buf_multi_expert_input contents], h_post, HIDDEN_DIM * sizeof(float));
+        memcpy([g_metal->buf_shared_gate contents], shared_gate,
+               SHARED_INTERMEDIATE * sizeof(float));
+        memcpy([g_metal->buf_shared_up contents], shared_up,
+               SHARED_INTERMEDIATE * sizeof(float));
+
+        // Wait for non-prediction async pread to complete
+        if (!pred_started && g_async_pread.active) {
+            async_pread_wait();
+            for (int k = 0; k < actual_K; k++) {
+                valid[k] = g_async_pread.valid[k];
+            }
+        }
+
         if (g_timing_enabled) { t1 = now_ms(); g_timing.expert_io += t1 - t0; }
 
+        // Store this layer's routing for next token's temporal prediction.
+        // MUST happen AFTER the prediction hit check above (which reads g_pred_experts).
+        if (g_pred_enabled && g_pred_generating) {
+            for (int k = 0; k < actual_K; k++) {
+                g_pred_experts[layer_idx][k] = expert_indices[k];
+            }
+            g_pred_count[layer_idx] = actual_K;
+            if (layer_idx == NUM_LAYERS - 1) {
+                g_pred_valid = 1;
+            }
+        }
+
         if (g_timing_enabled) { t0 = now_ms(); }
-        memcpy([g_metal->buf_multi_expert_input contents], h_post, HIDDEN_DIM * sizeof(float));
 
         // Step 3: encode ALL experts + shared expert into ONE command buffer.
         // Batched encoding: 4 encoders for K experts + 2 for shared = 6 total
@@ -5079,10 +5314,7 @@ static void fused_layer_forward(
         gpu_encode_experts_batched(g_metal, cmd_experts, actual_K, valid, expert_bufs);
 
         // Shared expert SwiGLU + down_proj (2 more encoders)
-        memcpy([g_metal->buf_shared_gate contents], shared_gate,
-               SHARED_INTERMEDIATE * sizeof(float));
-        memcpy([g_metal->buf_shared_up contents], shared_up,
-               SHARED_INTERMEDIATE * sizeof(float));
+        // Note: shared_gate/up already copied to GPU buffers above (before async pread wait)
 
         // SwiGLU dispatch
         {
@@ -6139,6 +6371,10 @@ static void serve_loop(
             int next_token = cpu_argmax(logits, VOCAB_SIZE);
 
             // ---- Auto-regressive generation with SSE streaming ----
+            if (g_pred_enabled) {
+                g_pred_generating = 1;
+                g_pred_valid = 0;
+            }
             double t_gen = now_ms();
             int gen_count = 0;
             int in_think = 0;
@@ -6278,6 +6514,8 @@ static void print_usage(const char *prog) {
     printf("  --cache-telemetry    Report cold vs eviction misses and reuse distance\n");
     printf("  --2bit               Use 2-bit quantized experts (packed_experts_2bit/)\n");
     printf("  --gpu-linear         Alias for the fused GPU delta-net path (default)\n");
+    printf("  --predict            Enable temporal expert prediction (prefetch during CMD1_wait)\n");
+    printf("  --collect-routing F  Log routing data to binary file F (for predictor training)\n");
     printf("  --think-budget N     Max thinking tokens before force </think> (default: 2048, 0=unlimited)\n");
     printf("  --serve PORT         Run HTTP server (OpenAI-compatible API)\n");
     printf("  --help               This message\n");
@@ -6317,6 +6555,8 @@ int main(int argc, char **argv) {
             {"gpu-linear",    no_argument,       0, 'G'},
             {"think-budget",  required_argument, 0, 'B'},
             {"serve",         required_argument, 0, 'R'},
+            {"predict",       no_argument,       0, 'D'},
+            {"collect-routing", required_argument, 0, 'Z'},
             {"help",          no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
@@ -6341,6 +6581,14 @@ int main(int argc, char **argv) {
                 case 'E': g_cache_telemetry_enabled = 1; break;
                 case '2': g_use_2bit = 1; break;
                 case 'G': gpu_linear_attn_enabled = 1; break;
+                case 'D': g_pred_enabled = 1; break;
+                case 'Z':
+                    g_routing_log = fopen(optarg, "wb");
+                    if (!g_routing_log) {
+                        fprintf(stderr, "ERROR: cannot open routing log: %s\n", optarg);
+                        return 1;
+                    }
+                    break;
                 case 'B': g_think_budget = atoi(optarg); break;
                 case 'R': serve_port = atoi(optarg); break;
                 case 'h': print_usage(argv[0]); return 0;
@@ -6512,9 +6760,9 @@ int main(int argc, char **argv) {
             layer_mmap_sizes[i] = 0;
             if (layer_fds[i] >= 0) {
                 expert_layers_available++;
-                // Enable aggressive readahead: each pread of 3.9MB should be
-                // a single large I/O, not fragmented into 512KB chunks
-                fcntl(layer_fds[i], F_RDAHEAD, 1);
+                // Disable readahead: expert reads are random (different offsets per token).
+                // Read-ahead prefetches adjacent data we won't use, wasting SSD bandwidth.
+                fcntl(layer_fds[i], F_RDAHEAD, 0);
                 struct stat st;
                 if (fstat(layer_fds[i], &st) == 0 && st.st_size > 0) {
                     layer_mmaps[i] = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, layer_fds[i], 0);
@@ -6531,9 +6779,50 @@ int main(int argc, char **argv) {
         }
         printf("[experts] %d/%d packed layer files available (mmap'd)\n", expert_layers_available, NUM_LAYERS);
 
+        // ---- LZ4 compressed experts: auto-detect and load ----
+        {
+            char lz4_probe[1024];
+            snprintf(lz4_probe, sizeof(lz4_probe), "%s/packed_experts_lz4/layer_00.bin", model_path);
+            if (!g_use_2bit && access(lz4_probe, R_OK) == 0) {
+                int lz4_layers = 0;
+                for (int i = 0; i < NUM_LAYERS; i++) {
+                    char lz4_path[1024];
+                    snprintf(lz4_path, sizeof(lz4_path), "%s/packed_experts_lz4/layer_%02d.bin", model_path, i);
+                    int lz4_fd = open(lz4_path, O_RDONLY);
+                    if (lz4_fd >= 0) {
+                        // Load index header (512 entries × 16 bytes = 8KB)
+                        g_lz4_index[i] = malloc(NUM_EXPERTS * sizeof(LZ4IndexEntry));
+                        ssize_t nr = pread(lz4_fd, g_lz4_index[i],
+                                           NUM_EXPERTS * sizeof(LZ4IndexEntry), 0);
+                        if (nr == NUM_EXPERTS * (ssize_t)sizeof(LZ4IndexEntry)) {
+                            // Replace the raw fd with the LZ4 fd
+                            close(layer_fds[i]);
+                            layer_fds[i] = lz4_fd;
+                            fcntl(lz4_fd, F_RDAHEAD, 1);
+                            lz4_layers++;
+                        } else {
+                            free(g_lz4_index[i]);
+                            g_lz4_index[i] = NULL;
+                            close(lz4_fd);
+                        }
+                    }
+                }
+                if (lz4_layers > 0) {
+                    g_use_lz4 = 1;
+                    // Allocate compressed read buffers (one per expert slot)
+                    for (int k = 0; k < MAX_K; k++) {
+                        g_lz4_comp_bufs[k] = malloc(EXPERT_SIZE + 4096);
+                    }
+                    printf("[lz4] %d/%d layers using LZ4 compressed experts\n",
+                           lz4_layers, NUM_LAYERS);
+                }
+            }
+        }
+
         // Wire up tiered I/O globals
         g_layer_fds_cold = layer_fds_cold;
-        printf("[tiered-io] Cold fds (F_NOCACHE) + warm fds (page cached) active\n");
+        if (!g_use_lz4)
+            printf("[tiered-io] Cold fds (F_NOCACHE) + warm fds (page cached) active\n");
 
         // Warm page cache hint
         if (expert_layers_available > 0) {
@@ -6722,6 +7011,10 @@ int main(int argc, char **argv) {
 
         // ---- Auto-regressive generation ----
         if (g_timing_enabled) timing_reset();
+        if (g_pred_enabled) {
+            g_pred_generating = 1;  // enable prediction storage/use during generation
+            g_pred_valid = 0;       // reset — first gen token builds predictions
+        }
         for (int gen = 1; gen < max_tokens; gen++) {
             double t_gen_start = now_ms();
 
@@ -6823,6 +7116,12 @@ int main(int argc, char **argv) {
         }
 
         if (g_freq_tracking) freq_print_analysis(K);
+        if (g_routing_log) {
+            fclose(g_routing_log);
+            fprintf(stderr, "[routing] Logged %d samples to routing data file\n",
+                    g_routing_log_samples);
+            g_routing_log = NULL;
+        }
 
         // ---- Cleanup ----
         io_pool_shutdown();
