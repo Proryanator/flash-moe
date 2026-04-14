@@ -1,5 +1,7 @@
 # Flash-MoE: Running a 397B Parameter Model on a Laptop
 
+Followed: https://github.com/danveloper/flash-moe/issues/15 for full instructions/troubleshooting.
+
 > **[Read the paper](paper/flash_moe.pdf)** — Full technical details, 90+ experiments, and the story of how an AI and a human built this in 24 hours.
 
 Pure C/Metal inference engine that runs **Qwen3.5-397B-A17B** (a 397 billion parameter Mixture-of-Experts model) on a MacBook Pro with 48GB RAM at **4.4+ tokens/second** with production-quality output including tool calling.
